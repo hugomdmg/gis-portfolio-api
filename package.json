@@ -1,0 +1,7 @@
+{
+    "scripts": {
+        "build": " docker build -t gis-server .",
+        "start": "docker run --name gis-server -p 8000:8000 gis-server",
+        "remove": "docker rm -f gis-server"
+    }
+}
