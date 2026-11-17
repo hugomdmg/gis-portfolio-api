@@ -1,7 +1,14 @@
 {
+    "name": "gis-server",
+    "version": "1.0.0",
+    "private": true,
     "scripts": {
-        "build": " docker build -t gis-server .",
-        "start": "docker run --name gis-server -p 8000:8000 gis-server",
-        "remove": "docker rm -f gis-server"
+        "build": "docker build -t gis-server .",
+        "start": "docker run -d --name gis-server -p 8000:8000 --add-host=host.docker.internal:host-gateway gis-server",
+        "stop": "docker stop gis-server",
+        "remove": "docker rm -f gis-server",
+        "logs": "docker logs -f gis-server",
+        "restart": "docker restart gis-server",
+        "clear": "docker system prune -a --volumes -f"
     }
 }
