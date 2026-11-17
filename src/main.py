@@ -45,7 +45,7 @@ DB_CONFIG = {
 @app.get("/")
 def root():
     return {
-        "app": settings.APP_NAME,
+        "app": settings.ALLOW_ORIGIN,
     }
 
 
