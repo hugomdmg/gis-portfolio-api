@@ -6,9 +6,15 @@ from pathlib import Path
 import subprocess
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
+from config import settings
+import tempfile
 
 
-app = FastAPI()
+app = FastAPI(
+    title=settings.APP_NAME,
+)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,103 +34,192 @@ RASTER_PATH = BASE_DIR / "data" / "world.tif"
 
 # Configuración de PostgreSQL
 DB_CONFIG = {
-    "host": "host.docker.internal",
-    "port": 5432,
-    "database": "mydb",
-    "user": "myuser",
-    "password": "mypassword",
+    "host": settings.DB_HOST,
+    "port": settings.DB_PORT,
+    "database": settings.DB_NAME,
+    "user": settings.DB_USER,
+    "password": settings.DB_PASSWORD,
 }
 
 
 @app.get("/")
-def home():
-    return {"message": "API funcionando correctamente"}
-
+def root():
+    return {
+        "app": settings.APP_NAME,
+    }
 
 
 @app.post("/rasters/import")
 def import_raster():
 
-    # Comprobar que existe el archivo
     if not RASTER_PATH.is_file():
         raise HTTPException(
-            status_code=404,
-            detail=f"No se encuentra el raster: {RASTER_PATH}"
+            status_code=404, detail=f"No se encuentra el raster: {RASTER_PATH}"
         )
 
-    # Configurar la conexión a PostgreSQL
     env = os.environ.copy()
     env["PGPASSWORD"] = DB_CONFIG["password"]
 
     raster_process = None
 
     try:
-        # Convertir el GeoTIFF a SQL de PostGIS
-        raster_process = subprocess.Popen(
-            [
-                "raster2pgsql",
-                "-c",
-                "-s", "4326",
-                "-I",
-                "-C",
-                "-M",
-                "-F",
-                "-t", "256x256",
-                str(RASTER_PATH),
-                "public.mapa_raster",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        with tempfile.TemporaryDirectory() as temp_dir:
 
-        # Ejecutar el SQL generado contra PostgreSQL
-        result = subprocess.run(
-            [
-                "psql",
-                "-v", "ON_ERROR_STOP=1",
-                "-h", DB_CONFIG["host"],
-                "-p", str(DB_CONFIG["port"]),
-                "-U", DB_CONFIG["user"],
-                "-d", DB_CONFIG["database"],
-            ],
-            stdin=raster_process.stdout,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+            filtered_path = Path(temp_dir) / "raster_filtered.tif"
 
-        # Cerrar el flujo de salida
-        raster_process.stdout.close()
-
-        # Recoger errores de raster2pgsql
-        raster_error = raster_process.stderr.read()
-        raster_code = raster_process.wait()
-
-        # Comprobar errores de importación
-        if result.returncode != 0 or raster_code != 0:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "message": "Error al importar el raster",
-                    "postgres_error": result.stderr,
-                    "raster_error": raster_error,
-                },
+            # 1. Convertir los valores 0 en NoData
+            # Se conservan las elevaciones positivas y la resolución original.
+            subprocess.run(
+                [
+                    "gdal_translate",
+                    "-a_nodata",
+                    "0",
+                    "-co",
+                    "TILED=YES",
+                    "-co",
+                    "COMPRESS=DEFLATE",
+                    str(RASTER_PATH),
+                    str(filtered_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
             )
 
-        return {
-            "message": "Raster importado correctamente",
-            "file": RASTER_PATH.name,
-            "table": "public.mapa_raster",
-            "srid": 4326,
-            "crs": "EPSG:4326",
-            "tile_size": "256x256",
-        }
+            # 2. Generar SQL mediante raster2pgsql
+            raster_process = subprocess.Popen(
+                [
+                    "raster2pgsql",
+                    "-c",
+                    "-s",
+                    "4326",
+                    "-I",
+                    "-C",
+                    "-M",
+                    "-F",
+                    "-t",
+                    "256x256",
+                    str(filtered_path),
+                    "public.mapa_raster",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            # 3. Importar el raster en PostGIS
+            result = subprocess.run(
+                [
+                    "psql",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-h",
+                    DB_CONFIG["host"],
+                    "-p",
+                    str(DB_CONFIG["port"]),
+                    "-U",
+                    DB_CONFIG["user"],
+                    "-d",
+                    DB_CONFIG["database"],
+                ],
+                stdin=raster_process.stdout,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            raster_process.stdout.close()
+
+            raster_error = raster_process.stderr.read()
+            raster_code = raster_process.wait()
+
+            if result.returncode != 0 or raster_code != 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": "Error al importar el raster",
+                        "postgres_error": result.stderr,
+                        "raster_error": raster_error,
+                    },
+                )
+
+            # 4. Eliminar teselas completamente NoData
+            cleanup_sql = """
+                DELETE FROM public.mapa_raster
+                WHERE ST_BandIsNoData(rast, 1, TRUE);
+            """
+
+            cleanup_result = subprocess.run(
+                [
+                    "psql",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-h",
+                    DB_CONFIG["host"],
+                    "-p",
+                    str(DB_CONFIG["port"]),
+                    "-U",
+                    DB_CONFIG["user"],
+                    "-d",
+                    DB_CONFIG["database"],
+                    "-c",
+                    cleanup_sql,
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            if cleanup_result.returncode != 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": "Error eliminando teselas vacías",
+                        "postgres_error": cleanup_result.stderr,
+                    },
+                )
+
+            # 5. Actualizar estadísticas de la tabla
+            subprocess.run(
+                [
+                    "psql",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-h",
+                    DB_CONFIG["host"],
+                    "-p",
+                    str(DB_CONFIG["port"]),
+                    "-U",
+                    DB_CONFIG["user"],
+                    "-d",
+                    DB_CONFIG["database"],
+                    "-c",
+                    "ANALYZE public.mapa_raster;",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            return {
+                "message": "Raster importado y optimizado correctamente",
+                "file": RASTER_PATH.name,
+                "table": "public.mapa_raster",
+                "srid": 4326,
+                "nodata_value": 0,
+                "tile_size": "256x256",
+                "empty_tiles_removed": True,
+            }
 
     except FileNotFoundError as e:
         raise HTTPException(
-            status_code=500,
-            detail=f"No se encuentra una herramienta necesaria: {e}"
+            status_code=500, detail=f"No se encuentra una herramienta necesaria: {e}"
+        )
+
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error ejecutando proceso: {e.stderr}"
         )
 
     finally:
@@ -133,27 +228,17 @@ def import_raster():
             raster_process.wait()
 
 
-
-
 @app.get("/terrain/download")
 def download_terrain():
 
     if not RASTER_PATH.is_file():
         raise HTTPException(
-            status_code=404,
-            detail="No se encuentra el archivo GeoTIFF original"
+            status_code=404, detail="No se encuentra el archivo GeoTIFF original"
         )
 
     return FileResponse(
-        path=str(RASTER_PATH),
-        media_type="image/tiff",
-        filename="world.tif"
+        path=str(RASTER_PATH), media_type="image/tiff", filename="world.tif"
     )
-
-
-
-
-
 
 
 @app.get("/terrain/grid")
@@ -163,15 +248,14 @@ def get_terrain_grid(
     max_lon: float = Query(180, ge=-180, le=180),
     max_lat: float = Query(60, ge=-90, le=90),
     width: int = Query(360, ge=2, le=512),
-    height: int = Query(120, ge=2, le=512)
+    height: int = Query(120, ge=2, le=512),
 ):
     conn = None
 
     # Comprobar los límites geográficos
     if min_lon >= max_lon or min_lat >= max_lat:
         raise HTTPException(
-            status_code=400,
-            detail="Los límites geográficos no son válidos"
+            status_code=400, detail="Los límites geográficos no son válidos"
         )
 
     try:
@@ -179,7 +263,8 @@ def get_terrain_grid(
 
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
 
-            cursor.execute("""
+            cursor.execute(
+                """
                 WITH bounds AS (
                     SELECT
                         ST_MakeEnvelope(
@@ -234,20 +319,27 @@ def get_terrain_grid(
                 CROSS JOIN grid g
 
                 ORDER BY g.row_idx, g.col_idx;
-            """, (
-                min_lon, min_lat, max_lon, max_lat,
-                min_lon, min_lat, max_lon, max_lat,
-                width, height,
-                height - 1, width - 1
-            ))
+            """,
+                (
+                    min_lon,
+                    min_lat,
+                    max_lon,
+                    max_lat,
+                    min_lon,
+                    min_lat,
+                    max_lon,
+                    max_lat,
+                    width,
+                    height,
+                    height - 1,
+                    width - 1,
+                ),
+            )
 
             pixels = cursor.fetchall()
 
         # Construir matriz de elevaciones
-        elevations = [
-            [None for _ in range(width)]
-            for _ in range(height)
-        ]
+        elevations = [[None for _ in range(width)] for _ in range(height)]
 
         for pixel in pixels:
             row = pixel["row_idx"]
@@ -261,24 +353,21 @@ def get_terrain_grid(
                 "min_lon": min_lon,
                 "min_lat": min_lat,
                 "max_lon": max_lon,
-                "max_lat": max_lat
+                "max_lat": max_lat,
             },
             "width": width,
             "height": height,
-            "elevations": elevations
+            "elevations": elevations,
         }
 
     except psycopg2.Error as e:
         raise HTTPException(
-            status_code=500,
-            detail=f"Error consultando PostGIS: {str(e)}"
+            status_code=500, detail=f"Error consultando PostGIS: {str(e)}"
         )
 
     finally:
         if conn:
             conn.close()
-
-
 
 
 @app.get("/rasters")
@@ -337,15 +426,11 @@ def get_rasters():
 
             raster_info = cursor.fetchone()
 
-        return {
-            "message": "Información del raster",
-            "raster": raster_info
-        }
+        return {"message": "Información del raster", "raster": raster_info}
 
     except psycopg2.Error as e:
         raise HTTPException(
-            status_code=500,
-            detail=f"Error consultando PostGIS: {str(e)}"
+            status_code=500, detail=f"Error consultando PostGIS: {str(e)}"
         )
 
     finally:
@@ -353,14 +438,12 @@ def get_rasters():
             conn.close()
 
 
-
-
 @app.get("/terrain/tile/{tile_x}/{tile_y}")
 def get_terrain_tile(
     tile_x: int,
     tile_y: int,
     width: int = Query(30, ge=2, le=256),
-    height: int = Query(30, ge=2, le=256)
+    height: int = Query(30, ge=2, le=256),
 ):
     TILE_SIZE = 10
 
@@ -385,7 +468,8 @@ def get_terrain_tile(
 
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
 
-            cursor.execute("""
+            cursor.execute(
+                """
                 WITH bounds AS (
                     SELECT
                         ST_MakeEnvelope(
@@ -432,24 +516,31 @@ def get_terrain_tile(
                 CROSS JOIN grid g
 
                 ORDER BY g.row_idx, g.col_idx;
-            """, (
-                min_lon, min_lat, max_lon, max_lat,
-                min_lon, max_lon, min_lon, width,
-                max_lat, max_lat, min_lat, height,
-                height, width
-            ))
+            """,
+                (
+                    min_lon,
+                    min_lat,
+                    max_lon,
+                    max_lat,
+                    min_lon,
+                    max_lon,
+                    min_lon,
+                    width,
+                    max_lat,
+                    max_lat,
+                    min_lat,
+                    height,
+                    height,
+                    width,
+                ),
+            )
 
             pixels = cursor.fetchall()
 
-        elevations = [
-            [None for _ in range(width)]
-            for _ in range(height)
-        ]
+        elevations = [[None for _ in range(width)] for _ in range(height)]
 
         for pixel in pixels:
-            elevations[pixel["row_idx"]][pixel["col_idx"]] = (
-                pixel["elevation"]
-            )
+            elevations[pixel["row_idx"]][pixel["col_idx"]] = pixel["elevation"]
 
         return {
             "tile_x": tile_x,
@@ -459,54 +550,28 @@ def get_terrain_tile(
                 "min_lon": min_lon,
                 "min_lat": min_lat,
                 "max_lon": max_lon,
-                "max_lat": max_lat
+                "max_lat": max_lat,
             },
             "width": width,
             "height": height,
-            "elevations": elevations
+            "elevations": elevations,
         }
 
     except psycopg2.Error as e:
-        raise HTTPException(
-            500,
-            detail=f"Error consultando PostGIS: {str(e)}"
-        )
+        raise HTTPException(500, detail=f"Error consultando PostGIS: {str(e)}")
 
     finally:
         if conn:
             conn.close()
 
 
-
 @app.get("/terrain/lod/{level}/{tile_x}/{tile_y}")
-def get_terrain_lod_tile(
-    level: int,
-    tile_x: int,
-    tile_y: int
-):
+def get_terrain_lod_tile(level: int, tile_x: int, tile_y: int):
     # Configuración de cada nivel
     LOD_CONFIG = {
-        0: {
-            "tile_size": 30,
-            "width": 30,
-            "height": 30,
-            "max_x": 12,
-            "max_y": 4
-        },
-        1: {
-            "tile_size": 10,
-            "width": 30,
-            "height": 30,
-            "max_x": 36,
-            "max_y": 12
-        },
-        2: {
-            "tile_size": 2,
-            "width": 60,
-            "height": 60,
-            "max_x": 180,
-            "max_y": 60
-        }
+        0: {"tile_size": 30, "width": 30, "height": 30, "max_x": 12, "max_y": 4},
+        1: {"tile_size": 10, "width": 30, "height": 30, "max_x": 36, "max_y": 12},
+        2: {"tile_size": 2, "width": 60, "height": 60, "max_x": 180, "max_y": 60},
     }
 
     if level not in LOD_CONFIG:
@@ -537,7 +602,8 @@ def get_terrain_lod_tile(
 
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
 
-            cursor.execute("""
+            cursor.execute(
+                """
                 WITH bounds AS (
                     SELECT
                         ST_MakeEnvelope(
@@ -586,24 +652,31 @@ def get_terrain_lod_tile(
                 CROSS JOIN grid g
 
                 ORDER BY g.row_idx, g.col_idx;
-            """, (
-                min_lon, min_lat, max_lon, max_lat,
-                min_lon, max_lon, min_lon, width,
-                max_lat, max_lat, min_lat, height,
-                height, width
-            ))
+            """,
+                (
+                    min_lon,
+                    min_lat,
+                    max_lon,
+                    max_lat,
+                    min_lon,
+                    max_lon,
+                    min_lon,
+                    width,
+                    max_lat,
+                    max_lat,
+                    min_lat,
+                    height,
+                    height,
+                    width,
+                ),
+            )
 
             pixels = cursor.fetchall()
 
-        elevations = [
-            [None for _ in range(width)]
-            for _ in range(height)
-        ]
+        elevations = [[None for _ in range(width)] for _ in range(height)]
 
         for pixel in pixels:
-            elevations[pixel["row_idx"]][pixel["col_idx"]] = (
-                pixel["elevation"]
-            )
+            elevations[pixel["row_idx"]][pixel["col_idx"]] = pixel["elevation"]
 
         return {
             "level": level,
@@ -615,18 +688,15 @@ def get_terrain_lod_tile(
                 "min_lon": min_lon,
                 "min_lat": min_lat,
                 "max_lon": max_lon,
-                "max_lat": max_lat
+                "max_lat": max_lat,
             },
             "width": width,
             "height": height,
-            "elevations": elevations
+            "elevations": elevations,
         }
 
     except psycopg2.Error as e:
-        raise HTTPException(
-            500,
-            detail=f"Error consultando PostGIS: {str(e)}"
-        )
+        raise HTTPException(500, detail=f"Error consultando PostGIS: {str(e)}")
 
     finally:
         if conn:
